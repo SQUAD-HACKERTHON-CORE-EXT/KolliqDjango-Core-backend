@@ -9,11 +9,11 @@ logger = logging.getLogger(__name__)
 @admin.register(Wallet)
 class WalletAdmin(admin.ModelAdmin):
     list_display = [
-        'user', 'squad_account_number', 'balance',
-        'escrow_balance', 'squad_creation_status', 'created_at'
+        'user', 'paystack_account_number', 'balance',
+        'escrow_balance', 'paystack_creation_status', 'created_at'
     ]
-    list_filter = ['squad_creation_status']
-    search_fields = ['user__phone', 'squad_account_number', 'user__full_name']
+    list_filter = ['paystack_creation_status']
+    search_fields = ['user__phone', 'paystack_account_number', 'user__full_name']
     readonly_fields = ['id', 'created_at', 'updated_at']
 
     def get_user_phone(self, obj):
@@ -31,7 +31,7 @@ class WithdrawalRequestAdmin(admin.ModelAdmin):
     search_fields = ['wallet__user__phone', 'bank_account_number', 'bank_account_name']
     readonly_fields = [
         'id', 'wallet', 'amount', 'bank_account_number', 'bank_code',
-        'bank_name', 'bank_account_name', 'squad_reference',
+        'bank_name', 'bank_account_name', 'paystack_reference',
         'reviewed_by', 'reviewed_at', 'created_at', 'updated_at',
     ]
     actions = ['approve_withdrawals', 'reject_withdrawals']
@@ -55,7 +55,7 @@ class WithdrawalRequestAdmin(admin.ModelAdmin):
             withdrawal.reviewed_at = timezone.now()
             withdrawal.squad_reference = f"SIM-{str(withdrawal.id).replace('-', '')[:16].upper()}"
             withdrawal.save(update_fields=[
-                'status', 'reviewed_by', 'reviewed_at', 'squad_reference', 'updated_at'
+                'status', 'reviewed_by', 'reviewed_at', 'paystack_reference', 'updated_at'
             ])
             success_count += 1
             logger.info(

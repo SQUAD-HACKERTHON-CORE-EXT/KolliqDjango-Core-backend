@@ -209,11 +209,13 @@ CORS_ALLOW_HEADERS = [
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Squad
-SQUAD_SECRET_KEY = env('SQUAD_SECRET_KEY', default='')
-SQUAD_PUBLIC_KEY = env('SQUAD_PUBLIC_KEY', default='')
-SQUAD_BASE_URL = env('SQUAD_BASE_URL', default='https://sandbox-api-d.squadco.com')
-SQUAD_WEBHOOK_SECRET = env('SQUAD_WEBHOOK_SECRET', default='')
+PAYSTACK_SECRET_KEY     = os.environ.get('PAYSTACK_SECRET_KEY', '')
+PAYSTACK_BASE_URL       = os.environ.get('PAYSTACK_BASE_URL', 'https://api.paystack.co')
+PAYSTACK_DVA_BANK       = os.environ.get('PAYSTACK_DVA_BANK', 'test-bank')
 
+KOLLIQ_ESCROW_DVA_NUMBER = os.environ.get('KOLLIQ_ESCROW_DVA_NUMBER', '')
+KOLLIQ_ESCROW_DVA_BANK   = os.environ.get('KOLLIQ_ESCROW_DVA_BANK', 'test-bank')  # display name for employers
+KOLLIQ_ESCROW_DVA_NAME   = os.environ.get('KOLLIQ_ESCROW_DVA_NAME', 'Kolliq Escrow')
 # Africa's Talking
 AT_USERNAME = env('AT_USERNAME', default='sandbox')
 AT_API_KEY = env('AT_API_KEY', default='')
@@ -243,12 +245,8 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # ── System Virtual Accounts (created once at deploy, never change) ──────────
-KOLLIQ_ESCROW_VIRTUAL_ACCOUNT = env('KOLLIQ_ESCROW_VIRTUAL_ACCOUNT', default='')
-KOLLIQ_PLATFORM_VIRTUAL_ACCOUNT = env('KOLLIQ_PLATFORM_VIRTUAL_ACCOUNT', default='')
-SQUAD_MERCHANT_ID = env('SQUAD_MERCHANT_ID', default='')
-KOLLIQ_ESCROW_CUSTOMER_ID = env('KOLLIQ_ESCROW_CUSTOMER_ID', default='kolliq-escrow')
-KOLLIQ_PLATFORM_CUSTOMER_ID = env('KOLLIQ_PLATFORM_CUSTOMER_ID', default='kolliq-platform')
-SQUAD_BENEFICIARY_ACCOUNT = env('SQUAD_BENEFICIARY_ACCOUNT', default='')
+
+
 
 # ── Demo Float for simulated loans/insurance disbursements ──────────────────
 DEMO_FLOAT_WALLET_ID = env.int('DEMO_FLOAT_WALLET_ID', default=2)
@@ -310,6 +308,10 @@ CELERY_BEAT_SCHEDULE = {
         'options': {
             'expires': 60 * 60,   # task expires after 1 hour if not picked up
         },
+     'reconcile-withdrawals': {
+            'task': 'apps.wallets.payout_tasks.reconcile_pending_withdrawals',
+            'schedule': crontab(minute='*/30'),
+        }
     },
 
     # ── Daily summary report — midnight Lagos time (UTC+1) ────────────────────
@@ -355,5 +357,15 @@ RECONCILIATION_ALERT_EMAILS = [
 
 # Slack incoming webhook URL (optional — set to None to disable)
 SLACK_ALERT_WEBHOOK_URL = None  # e.g. 'https://hooks.slack.com/services/xxx/yyy/zzz'
+
+EMAIL_BACKEND       = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST          = 'smtp.gmail.com'
+EMAIL_PORT          = 587
+EMAIL_USE_TLS       = True
+EMAIL_HOST_USER     = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL  = f'Kolliq Alerts <{EMAIL_HOST_USER}>'
+
+ADMIN_NOTIFY_EMAILS = os.environ.get('ADMIN_NOTIFY_EMAILS', '').split(',') if os.environ.get('ADMIN_NOTIFY_EMAILS') else []
 
 

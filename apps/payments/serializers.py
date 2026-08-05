@@ -13,6 +13,6 @@ class TransactionSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'transaction_type', 'amount', 'status',
             'job_title', 'related_user_phone',
-            'description', 'squad_reference',
-            'created_at',
+            'description', 'paystack_reference',
+            'created_at', 'idempotency_key', 'metadata',
         ]

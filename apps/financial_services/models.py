@@ -68,7 +68,7 @@ class Loan(UserOwnedModel):
 
     # Always 'demo_float' in pilot — 'partner_name' when live
     funding_source = models.CharField(max_length=100, default='demo_float')
-    squad_disbursement_ref = models.CharField(max_length=200, blank=True)
+    disbursement_ref = models.CharField(max_length=200, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -1,40 +1,63 @@
+"""
+apps/users/tasks.py
+====================
+Squad → Paystack, BVN removed, and de-duplicated against apps/wallets/tasks.py.
+
+WHY THIS CHANGED STRUCTURALLY:
+  The old version stored VA details on the User model (squad_account_number,
+  squad_account_status, etc.) AND apps/wallets/tasks.py separately stores the
+  same data on the Wallet model. Two independent provisioning paths for the
+  same Paystack customer is how you end up with duplicate customers, orphaned
+  DVAs, or a User/Wallet pair that disagree about readiness.
+
+  Fix: this file now ONLY handles retry scheduling and backoff. The actual
+  Paystack calls live in exactly one place — apps/wallets/tasks.py
+  create_wallet_for_user(). This task just re-invokes that, with backoff,
+  until it succeeds or exhausts retries.
+
+  All account state (account number, bank name, status) lives on Wallet only.
+  The User model no longer needs squad_account_number / squad_account_status
+  fields at all — remove them in a migration (see bottom of this file).
+
+TRIGGER:
+  Wire this from the same post_save signal that calls create_wallet_for_user,
+  OR call it manually from an admin action when you see wallet.paystack_creation_status
+  == 'failed' and want to retry with backoff instead of an immediate retry.
+"""
+
 import logging
 from celery import shared_task
 from celery.exceptions import MaxRetriesExceededError
-from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of retry attempts before giving up
 MAX_RETRIES = 5
 
-# Exponential backoff delays in seconds:
-# Attempt 1 → 1 min, 2 → 4 min, 3 → 9 min, 4 → 16 min, 5 → 25 min
+
 def backoff(attempt: int) -> int:
+    """Exponential backoff in seconds: 60, 240, 540, 960, 1500"""
     return 60 * (attempt ** 2)
 
 
 @shared_task(
     bind=True,
     max_retries=MAX_RETRIES,
-    name='users.tasks.retry_squad_virtual_account',
+    name='users.tasks.retry_paystack_wallet_provisioning',
 )
-def retry_squad_virtual_account(self, user_id: str):
+def retry_paystack_wallet_provisioning(self, user_id: str):
     """
-    Retries Squad virtual account creation for a user whose initial
-    attempt failed (e.g. due to timeout or API error during registration).
+    Retries Paystack wallet provisioning (customer + DVA) for a user whose
+    initial attempt failed. No BVN involved anywhere in this flow.
 
-    Queued automatically via a Django post_save signal whenever
-    squad_account_status is set to 'failed'.
+    Delegates the actual provisioning to apps.wallets.tasks.create_wallet_for_user
+    so there is exactly one code path that talks to Paystack.
 
-    Retries up to MAX_RETRIES times with exponential backoff.
-    On final failure, squad_account_status is set to 'permanently_failed'
-    so ops/support can identify and manually resolve affected users.
+    On final failure after MAX_RETRIES, marks wallet.paystack_creation_status
+    as 'permanently_failed' for manual review.
     """
-    # Import here to avoid circular imports at module load time
     from django.contrib.auth import get_user_model
     from apps.wallets.models import Wallet
-    from services.squad import SquadService
+    from apps.wallets.tasks import create_wallet_for_user
 
     User = get_user_model()
 
@@ -42,97 +65,61 @@ def retry_squad_virtual_account(self, user_id: str):
     try:
         user = User.objects.select_related('wallet').get(id=user_id)
     except User.DoesNotExist:
-        # User was deleted between task enqueue and execution — nothing to do
-        logger.warning(f"[Squad Retry] User {user_id} not found. Aborting task.")
+        logger.warning(f'[Wallet Retry] User {user_id} not found. Aborting.')
         return
 
-    # ── Guard: skip if VA already active ──────────────────────────────────
-    # Handles the race condition where another retry already succeeded,
-    # or the user somehow got a VA through another path.
-    if user.squad_account_status == 'active':
-        logger.info(f"[Squad Retry] User {user_id} already has an active VA. Skipping.")
+    # ── Guard: skip if wallet already provisioned ──────────────────────────
+    # Handles the race where another attempt already succeeded.
+    wallet = getattr(user, 'wallet', None)
+    if wallet and wallet.paystack_creation_status == 'created':
+        logger.info(f'[Wallet Retry] User {user_id} already has an active wallet. Skipping.')
         return
 
-    # ── Attempt Squad VA creation ──────────────────────────────────────────
+    attempt_number = self.request.retries + 1
     logger.info(
-        f"[Squad Retry] Attempting VA creation for user {user_id} "
-        f"(attempt {self.request.retries + 1}/{MAX_RETRIES})"
+        f'[Wallet Retry] Attempting provisioning for user {user_id} '
+        f'(attempt {attempt_number}/{MAX_RETRIES})'
     )
 
     try:
-        full_name = user.full_name or ''
-        name_parts = full_name.split()
-        first_name = name_parts[0] if name_parts else ''
-        middle_name = name_parts[2] if len(name_parts) >= 3 else ''
-        last_name = name_parts[1] if len(name_parts) >= 1 else 'User'
+        # Delegate to the single provisioning function — no duplicate Paystack logic here.
+        # Calling .run() (not .delay()) executes it synchronously inside this task
+        # so we can catch failures and control the backoff ourselves.
+        create_wallet_for_user.run(user_id)
 
-        dob = ''
-        if user.date_of_birth:
-            dob = user.date_of_birth.strftime('%m/%d/%Y')
-
-        gender = '1'
-        if user.gender == 'F':
-            gender = '2'
-
-        squad_service = SquadService()
-        squad_response = squad_service.create_virtual_account(
-            customer_identifier=str(user.id),
-            first_name=first_name or full_name[:50] or user.phone,
-            last_name=last_name,
-            middle_name=middle_name,
-            phone=user.phone,
-            email=user.email or f"{user.phone}@kolliq.ng",
-            dob=dob,
-            bvn=user.bvn or '',
-            gender=gender,
-            address=user.address or '',
-        )
-
-        # ── Success: persist VA details ────────────────────────────────────
-        user.squad_account_number = squad_response.get('squad_account_number')
-        user.squad_bank_name = squad_response.get('squad_bank_name', 'GTBank')
-        user.squad_account_status = 'active'
-        user.squad_account_created_at = timezone.now()
-        user.save(update_fields=[
-            'squad_account_number',
-            'squad_bank_name',
-            'squad_account_status',
-            'squad_account_created_at',
-        ])
-
-        try:
-            wallet = Wallet.objects.get(user=user)
-            wallet.squad_account_number = squad_response.get('squad_account_number')
-            wallet.squad_bank_name = squad_response.get('squad_bank_name', 'GTBank')
-            wallet.save(update_fields=['squad_account_number', 'squad_bank_name'])
-        except Wallet.DoesNotExist:
-            logger.warning(f"[Squad Retry] Wallet not found for user {user_id} after VA success.")
+        # Re-check status after the call — create_wallet_for_user swallows its
+        # own PaystackAPIError and just sets status to 'failed', it doesn't raise
+        # by the time we get here unless something unexpected happened.
+        wallet = Wallet.objects.get(user=user)
+        if wallet.paystack_creation_status != 'created':
+            raise RuntimeError(
+                f'Provisioning did not complete: status={wallet.paystack_creation_status}'
+            )
 
         logger.info(
-            f"[Squad Retry] VA created successfully for user {user_id}: "
-            f"{user.squad_account_number}"
+            f'[Wallet Retry] Wallet provisioned for user {user_id}: '
+            f'{wallet.paystack_account_number}'
         )
 
     except Exception as exc:
-        # ── Failure: decide whether to retry or give up ────────────────────
-        attempt_number = self.request.retries + 1
         delay = backoff(attempt_number)
-
         logger.error(
-            f"[Squad Retry] Attempt {attempt_number}/{MAX_RETRIES} failed for user {user_id}: "
-            f"{str(exc)}. Retrying in {delay}s.",
+            f'[Wallet Retry] Attempt {attempt_number}/{MAX_RETRIES} failed for '
+            f'user {user_id}: {exc}. Retrying in {delay}s.',
             exc_info=True,
         )
 
         try:
-            # countdown=delay tells Celery to wait `delay` seconds before next attempt
             raise self.retry(exc=exc, countdown=delay)
 
         except MaxRetriesExceededError:
-            # All retries exhausted — mark permanently failed for manual intervention
             logger.critical(
-                f"[Squad Retry] All {MAX_RETRIES} retries exhausted for user {user_id}. "
-                f"Marking as permanently_failed. Manual intervention required."
+                f'[Wallet Retry] All {MAX_RETRIES} retries exhausted for user {user_id}. '
+                f'Marking permanently_failed. Manual intervention required.'
             )
-            user.squad_account_status = 'permanently_failed'
-            user.save(update_fields=['squad_account_status'])
+            Wallet.objects.filter(user=user).update(
+                paystack_creation_status='permanently_failed'
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────

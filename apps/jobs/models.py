@@ -112,7 +112,10 @@ class JobApplication(UserOrganizedModel):
         unique_together = [['job', 'worker']]
 
     def __str__(self):
-        return f"{self.worker.phone} → {self.job.title} ({self.status})"
+        # phone is optional post phone->email migration — fall back through
+        # email, then phone, then raw id so this never prints a bare "None".
+        worker_label = self.worker.email or self.worker.phone or str(self.worker.id)
+        return f"{worker_label} → {self.job.title} ({self.status})"
 
     def can_access_record(self, user):
         """Worker and job employer can access application."""
@@ -143,7 +146,10 @@ class Rating(UserOrganizedModel):
         unique_together = [['from_user', 'to_user', 'job']]
 
     def __str__(self):
-        return f"{self.from_user.phone} → {self.to_user.phone}: {self.stars}⭐"
+        # Same fallback chain as JobApplication — phone is optional now.
+        from_label = self.from_user.email or self.from_user.phone or str(self.from_user.id)
+        to_label = self.to_user.email or self.to_user.phone or str(self.to_user.id)
+        return f"{from_label} → {to_label}: {self.stars}⭐"
 
     def can_access_record(self, user):
         """Both the rater and rated user can view the rating."""

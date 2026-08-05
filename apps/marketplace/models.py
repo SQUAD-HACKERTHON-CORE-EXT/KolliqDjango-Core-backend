@@ -125,7 +125,10 @@ class Listing(models.Model):
         ordering = ['-is_featured', '-created_at']
 
     def __str__(self):
-        return f"{self.title} — ₦{self.price} ({self.seller.phone})"
+        # phone is optional post phone->email migration — fall back through
+        # email, then phone, then raw id so this never prints a bare "None".
+        seller_label = self.seller.email or self.seller.phone or str(self.seller.id)
+        return f"{self.title} — ₦{self.price} ({seller_label})"
 
     def increment_views(self):
         self.views_count += 1

@@ -9,9 +9,9 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id',
+            'email',
             'phone',
             'full_name',
-            'email',
             'role',
             'gender',
             'date_of_birth',
@@ -33,10 +33,6 @@ class UserSerializer(serializers.ModelSerializer):
             'is_active',
             'is_verified',
             'onboarding_complete',
-            'squad_account_number',
-            'squad_bank_name',
-            'squad_account_status',
-            'squad_account_created_at',
             'last_login',
             'created_at',
         ]
@@ -46,9 +42,9 @@ class UserSerializer(serializers.ModelSerializer):
 class UserCreateSerializer(serializers.Serializer):
     """Write serializer — validates incoming data for user creation."""
 
-    phone = serializers.CharField(max_length=20)
+    email = serializers.EmailField()
+    phone = serializers.CharField(max_length=20, required=False, allow_null=True, allow_blank=True)
     full_name = serializers.CharField(max_length=255, required=False, default='')
-    email = serializers.EmailField(required=False, allow_null=True)
     role = serializers.ChoiceField(
         choices=[(r.value, r.name) for r in User.Role],
         required=False,
@@ -60,7 +56,6 @@ class UserCreateSerializer(serializers.Serializer):
         allow_null=True
     )
     date_of_birth = serializers.DateField(required=False, allow_null=True)
-    bvn = serializers.CharField(max_length=11, required=False, allow_blank=True, allow_null=True)
     address = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     location_area = serializers.CharField(max_length=255, required=False, default='')
     location_city = serializers.CharField(max_length=255, required=False, default='Lagos')
@@ -80,35 +75,30 @@ class UserCreateSerializer(serializers.Serializer):
     channel = serializers.CharField(max_length=50, required=False, default='app')
     pin = serializers.CharField(min_length=4, max_length=6, write_only=True, required=False)
 
-    def validate_phone(self, value):
-        # Normalise: strip spaces, ensure it starts with a digit or +
-        value = value.strip().replace(' ', '')
-        if not value:
-            raise serializers.ValidationError("Phone number cannot be empty.")
-        return value
+    def validate_email(self, value):
+        return value.strip().lower()
 
-    def validate_bvn(self, value):
-        if value and not value.isdigit():
-            raise serializers.ValidationError("BVN must contain only digits.")
-        if value and len(value) != 11:
-            raise serializers.ValidationError("BVN must be exactly 11 digits.")
+    def validate_phone(self, value):
+        if not value:
+            return value
+        value = value.strip().replace(' ', '')
         return value
 
 
 class LoginSerializer(serializers.Serializer):
+    """Validates login credentials (email + PIN)."""
 
-    """Validates login credentials (phone + PIN)."""
-
-    phone = serializers.CharField(max_length=20)
+    email = serializers.EmailField()
     pin = serializers.CharField(min_length=4, max_length=6, write_only=True)
 
-    def validate_phone(self, value):
-        return value.strip().replace(' ', '')
+    def validate_email(self, value):
+        return value.strip().lower()
 
     def validate_pin(self, value):
         if not value.isdigit():
             raise serializers.ValidationError("PIN must contain digits only.")
         return value
+
 
 class ChangePinSerializer(serializers.Serializer):
     """Authenticated user changing their own PIN — requires old PIN for verification."""
@@ -127,7 +117,7 @@ class ChangePinSerializer(serializers.Serializer):
         max_length=6,
         write_only=True,
     )
- 
+
     def validate(self, attrs):
         if attrs['new_pin'] != attrs['confirm_new_pin']:
             raise serializers.ValidationError({
@@ -138,32 +128,26 @@ class ChangePinSerializer(serializers.Serializer):
                 'new_pin': 'New PIN must be different from your current PIN.'
             })
         return attrs
- 
- 
+
+
 class ResetPinRequestSerializer(serializers.Serializer):
-    """Step 1 — request a reset OTP via phone number."""
-    phone = serializers.CharField(max_length=20)
- 
-    def validate_phone(self, value):
-        value = value.strip()
-        if value.startswith('0'):
-            value = '+234' + value[1:]
-        return value
- 
- 
+    """Step 1 — request a reset OTP via email."""
+    email = serializers.EmailField()
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+
 class ResetPinConfirmSerializer(serializers.Serializer):
     """Step 2 — verify OTP and set a new PIN."""
-    phone = serializers.CharField(max_length=20)
+    email = serializers.EmailField()
     otp = serializers.CharField(min_length=4, max_length=8, write_only=True)
     new_pin = serializers.CharField(min_length=4, max_length=6, write_only=True)
     confirm_new_pin = serializers.CharField(min_length=4, max_length=6, write_only=True)
- 
-    def validate_phone(self, value):
-        value = value.strip()
-        if value.startswith('0'):
-            value = '+234' + value[1:]
-        return value
- 
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
     def validate(self, attrs):
         if attrs['new_pin'] != attrs['confirm_new_pin']:
             raise serializers.ValidationError({

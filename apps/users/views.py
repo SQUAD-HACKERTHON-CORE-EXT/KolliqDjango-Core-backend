@@ -18,10 +18,10 @@ from apps.users.serializers import (
     ResetPinRequestSerializer,
     ResetPinConfirmSerializer,
 )
-from services.africas_talking import ATService
+from services.email_service import EmailService
 
 logger = logging.getLogger(__name__)
-_at = ATService()
+_email = EmailService()
 BEARER_SECURITY = [{"bearerAuth": []}]
 
 
@@ -37,15 +37,16 @@ def _user_response(user, status_code=status.HTTP_200_OK):
     )
 
 
-def _send_otp_sms(phone: str, otp: str) -> None:
+def _send_otp_email(email: str, otp: str) -> None:
+    subject = "Your Kolliq PIN Reset Code"
     message = (
         f"Your reset OTP is {otp}. "
         "It expires in 10 minutes. Do not share it with anyone."
     )
-    result = _at.send_sms(phone, message)
+    result = _email.send_email(email, subject, message)
     if not result.get("success"):
-        logger.error("ATService failed to deliver OTP to %s — provider response: %s", phone, result)
-        raise RuntimeError("SMS delivery failed")
+        logger.error("EmailService failed to deliver OTP to %s — response: %s", email, result)
+        raise RuntimeError("Email delivery failed")
 
 
 class RegisterView(APIView):
@@ -56,18 +57,19 @@ class RegisterView(APIView):
         description=(
             "Creates a new user account. Returns access + refresh JWT tokens "
             "and the full user profile on success. "
-            "Returns 409 if the phone number is already registered."
+            "Returns 409 if the email (or phone, if supplied) is already registered."
         ),
         request=UserCreateSerializer,
         responses={
             201: OpenApiResponse(response=UserSerializer, description="Account created."),
             400: OpenApiResponse(description="Validation error."),
-            409: OpenApiResponse(description="Phone number already registered."),
+            409: OpenApiResponse(description="Email or phone number already registered."),
         },
         examples=[
             OpenApiExample(
                 "Worker registration",
                 value={
+                    "email": "amaka.obi@example.com",
                     "phone": "+2348012345678",
                     "pin": "123456",
                     "full_name": "Amaka Obi",
@@ -86,9 +88,16 @@ class RegisterView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         data = serializer.validated_data
-        phone = data["phone"]
+        email = data["email"]
+        phone = data.get("phone") or None
 
-        if User.objects.filter(phone=phone).exists():
+        if User.objects.filter(email=email).exists():
+            return Response(
+                {"detail": "An account with this email already exists."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if phone and User.objects.filter(phone=phone).exists():
             return Response(
                 {"detail": "An account with this phone number already exists."},
                 status=status.HTTP_409_CONFLICT,
@@ -96,9 +105,9 @@ class RegisterView(APIView):
 
         pin = data.pop("pin", None)
         user = User(
+            email=email,
             phone=phone,
             full_name=data.get("full_name", ""),
-            email=data.get("email"),
             role=data.get("role", User.Role.WORKER),
             gender=data.get("gender"),
             date_of_birth=data.get("date_of_birth"),
@@ -117,13 +126,11 @@ class RegisterView(APIView):
             channel=data.get("channel", "app"),
         )
 
-        if data.get("bvn"):
-            user.bvn = data["bvn"]
         if pin:
             user.set_pin(pin)
         user.save()
 
-        logger.info("New user registered: %s (role=%s)", phone, user.role)
+        logger.info("New user registered: %s (role=%s)", email, user.role)
         return _user_response(user, status_code=status.HTTP_201_CREATED)
 
 
@@ -131,22 +138,22 @@ class LoginView(APIView):
     permission_classes = [AllowAny]
 
     @extend_schema(
-        summary="Login with phone + PIN",
+        summary="Login with email + PIN",
         description=(
-            "Authenticates a user with their phone number and PIN. "
+            "Authenticates a user with their email and PIN. "
             "Returns access + refresh JWT tokens and the full user profile."
         ),
         request=LoginSerializer,
         responses={
             200: OpenApiResponse(response=UserSerializer, description="Login successful."),
             400: OpenApiResponse(description="Validation error."),
-            401: OpenApiResponse(description="Invalid phone number or PIN."),
+            401: OpenApiResponse(description="Invalid email or PIN."),
             403: OpenApiResponse(description="Account is deactivated."),
         },
         examples=[
             OpenApiExample(
                 "Login example",
-                value={"phone": "+2347061003002", "pin": "1234"},
+                value={"email": "amaka.obi@example.com", "pin": "1234"},
                 request_only=True,
             ),
         ],
@@ -157,24 +164,24 @@ class LoginView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        phone = serializer.validated_data["phone"]
+        email = serializer.validated_data["email"]
         pin = serializer.validated_data["pin"]
 
         try:
-            user = User.objects.get(phone=phone)
+            user = User.objects.get(email=email)
         except User.DoesNotExist:
-            return Response({"detail": "Invalid phone number or PIN."}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response({"detail": "Invalid email or PIN."}, status=status.HTTP_401_UNAUTHORIZED)
 
         if not user.is_active:
             return Response({"detail": "This account has been deactivated."}, status=status.HTTP_403_FORBIDDEN)
 
         if not user.check_pin(pin):
-            return Response({"detail": "Invalid phone number or PIN."}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response({"detail": "Invalid email or PIN."}, status=status.HTTP_401_UNAUTHORIZED)
 
         user.last_login = timezone.now()
         user.save(update_fields=["last_login"])
 
-        logger.info("User logged in: %s", phone)
+        logger.info("User logged in: %s", email)
         return _user_response(user)
 
 
@@ -219,7 +226,7 @@ class MeView(APIView):
 
     @extend_schema(
         summary="Get current user identity",
-        description="Returns id, phone, full_name, and role of the authenticated user.",
+        description="Returns id, email, phone, full_name, and role of the authenticated user.",
         request=None,
         responses={
             200: OpenApiResponse(description="Current user identity."),
@@ -228,7 +235,13 @@ class MeView(APIView):
         examples=[
             OpenApiExample(
                 "Identity response",
-                value={"id": "b04f4f06-82b3-4b1c-8401-eef8aa0d5abf", "phone": "+2348012345678", "full_name": "Amaka Obi", "role": "worker"},
+                value={
+                    "id": "b04f4f06-82b3-4b1c-8401-eef8aa0d5abf",
+                    "email": "amaka.obi@example.com",
+                    "phone": "+2348012345678",
+                    "full_name": "Amaka Obi",
+                    "role": "worker",
+                },
                 response_only=True,
             ),
         ],
@@ -237,7 +250,13 @@ class MeView(APIView):
     def get(self, request):
         user = request.user
         return Response(
-            {"id": user.id, "phone": user.phone, "full_name": user.full_name, "role": user.role},
+            {
+                "id": user.id,
+                "email": user.email,
+                "phone": user.phone,
+                "full_name": user.full_name,
+                "role": user.role,
+            },
             status=status.HTTP_200_OK,
         )
 
@@ -246,7 +265,7 @@ class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
     UPDATABLE_FIELDS = [
-        "full_name", "email", "gender", "date_of_birth",
+        "full_name", "phone", "gender", "date_of_birth",
         "address", "location_area", "location_city",
         "location_lat", "location_lng", "skills", "languages",
         "has_vehicle", "vehicle_type", "availability",
@@ -268,7 +287,11 @@ class ProfileView(APIView):
 
     @extend_schema(
         summary="Update user profile",
-        description="Partially updates the authenticated user's profile. Only whitelisted fields accepted.",
+        description=(
+            "Partially updates the authenticated user's profile. Only whitelisted fields "
+            "accepted. Email is intentionally excluded — changing login email is a separate "
+            "verified flow."
+        ),
         request=UserSerializer,
         responses={
             200: OpenApiResponse(response=UserSerializer, description="Updated user profile."),
@@ -334,7 +357,7 @@ class ChangePinView(APIView):
 
         user.set_pin(data["new_pin"])
         user.save(update_fields=["pin"])
-        logger.info("PIN changed for user: %s", user.phone)
+        logger.info("PIN changed for user: %s", user.email)
         return Response({"detail": "PIN changed successfully."}, status=status.HTTP_200_OK)
 
 
@@ -344,17 +367,17 @@ class ResetPinRequestView(APIView):
     @extend_schema(
         summary="Request PIN reset OTP",
         description=(
-            "Sends a 6-digit OTP via SMS. Always returns 200 to prevent user enumeration. "
+            "Sends a 6-digit OTP via email. Always returns 200 to prevent user enumeration. "
             "OTP expires in 10 minutes."
         ),
         request=ResetPinRequestSerializer,
         responses={
-            200: OpenApiResponse(description="OTP sent if number is registered."),
+            200: OpenApiResponse(description="OTP sent if email is registered."),
             400: OpenApiResponse(description="Validation error."),
-            503: OpenApiResponse(description="SMS delivery failed."),
+            503: OpenApiResponse(description="Email delivery failed."),
         },
         examples=[
-            OpenApiExample("Request OTP", value={"phone": "+2347061003002"}, request_only=True),
+            OpenApiExample("Request OTP", value={"email": "amaka.obi@example.com"}, request_only=True),
         ],
         tags=["PIN Reset"],
     )
@@ -363,22 +386,22 @@ class ResetPinRequestView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        phone = serializer.validated_data["phone"]
+        email = serializer.validated_data["email"]
 
         try:
-            user = User.objects.get(phone=phone)
+            user = User.objects.get(email=email)
         except User.DoesNotExist:
-            return Response({"detail": "If that number is registered, an OTP has been sent."}, status=status.HTTP_200_OK)
+            return Response({"detail": "If that email is registered, an OTP has been sent."}, status=status.HTTP_200_OK)
 
         otp_record = PinResetOTP.create_for_user(user)
 
         try:
-            _send_otp_sms(phone, otp_record.otp)
+            _send_otp_email(email, otp_record.otp)
         except Exception:
-            logger.exception("Failed to send OTP SMS to %s", phone)
+            logger.exception("Failed to send OTP email to %s", email)
             return Response({"detail": "Could not send OTP. Please try again later."}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
-        return Response({"detail": "If that number is registered, an OTP has been sent."}, status=status.HTTP_200_OK)
+        return Response({"detail": "If that email is registered, an OTP has been sent."}, status=status.HTTP_200_OK)
 
 
 class ResetPinConfirmView(APIView):
@@ -395,7 +418,7 @@ class ResetPinConfirmView(APIView):
         examples=[
             OpenApiExample(
                 "Confirm reset",
-                value={"phone": "+2347061003002", "otp": "482910", "new_pin": "5678"},
+                value={"email": "amaka.obi@example.com", "otp": "482910", "new_pin": "5678"},
                 request_only=True,
             ),
         ],
@@ -407,12 +430,12 @@ class ResetPinConfirmView(APIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         data = serializer.validated_data
-        phone = data["phone"]
+        email = data["email"]
         otp_value = data["otp"]
         new_pin = data["new_pin"]
 
         try:
-            user = User.objects.get(phone=phone)
+            user = User.objects.get(email=email)
         except User.DoesNotExist:
             return Response({"detail": "Invalid or expired OTP."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -432,5 +455,5 @@ class ResetPinConfirmView(APIView):
         user.set_pin(new_pin)
         user.save(update_fields=["pin"])
 
-        logger.info("PIN reset completed for user: %s", phone)
+        logger.info("PIN reset completed for user: %s", email)
         return Response({"detail": "PIN reset successfully."}, status=status.HTTP_200_OK)

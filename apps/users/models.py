@@ -9,29 +9,31 @@ from django.utils import timezone
 
 
 class UserManager(BaseUserManager):
-    """Custom manager — phone is the unique identifier, not username."""
+    """Custom manager — email is the unique identifier, not username."""
 
-    def create_user(self, phone, pin=None, **extra_fields):
-        if not phone:
-            raise ValueError("Phone number is required.")
-        user = self.model(phone=phone, **extra_fields)
+    def create_user(self, email, phone=None, pin=None, **extra_fields):
+        if not email:
+            raise ValueError("Email is required.")
+        email = self.normalize_email(email)
+        user = self.model(email=email, phone=phone, **extra_fields)
         if pin:
             user.set_pin(pin)
         user.save(using=self._db)
         return user
 
-    def create_superuser(self, phone, pin=None, **extra_fields):
+    def create_superuser(self, email, phone=None, pin=None, **extra_fields):
         extra_fields.setdefault('is_staff', True)
         extra_fields.setdefault('is_superuser', True)
-        return self.create_user(phone, pin=pin, **extra_fields)
+        return self.create_user(email, phone=phone, pin=pin, **extra_fields)
 
 
 class User(AbstractBaseUser):
     """
     Custom user model.
-    - Phone is the login identifier.
+    - Email is the login identifier.
     - PIN is hashed (not password) — use set_pin / check_pin.
-    - Token-based auth via DRF's TokenAuthentication.
+    - JWT-based auth via djangorestframework-simplejwt.
+    - Phone is optional profile data only — not used for auth or delivery.
     """
 
     # ------------------------------------------------------------------ #
@@ -59,7 +61,8 @@ class User(AbstractBaseUser):
     #  Core identity
     # ------------------------------------------------------------------ #
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    phone = models.CharField(max_length=20, unique=True, db_index=True)
+    email = models.EmailField(unique=True, db_index=True)
+    phone = models.CharField(max_length=20, unique=True, blank=True, null=True, db_index=True)
     pin = models.CharField(max_length=128, blank=True)  # Hashed PIN
 
     # ------------------------------------------------------------------ #
@@ -67,11 +70,9 @@ class User(AbstractBaseUser):
     # ------------------------------------------------------------------ #
     full_name = models.CharField(max_length=255, blank=True, default='')
     middle_name = models.CharField(max_length=255, blank=True, default='')
-    email = models.EmailField(blank=True, null=True)
     role = models.CharField(max_length=20, choices=Role.choices, default=Role.WORKER)
     gender = models.CharField(max_length=1, choices=Gender.choices, blank=True, null=True)
     date_of_birth = models.DateField(blank=True, null=True)
-    bvn = models.CharField(max_length=11, blank=True, null=True)
     address = models.TextField(blank=True, null=True)
 
     # ------------------------------------------------------------------ #
@@ -108,19 +109,6 @@ class User(AbstractBaseUser):
     onboarding_complete = models.BooleanField(default=False)
 
     # ------------------------------------------------------------------ #
-    #  Squad virtual account
-    # ------------------------------------------------------------------ #
-    squad_account_number = models.CharField(max_length=20, blank=True, null=True)
-    squad_bank_name = models.CharField(max_length=100, blank=True, null=True)
-    squad_account_status = models.CharField(
-        max_length=20,
-        blank=True,
-        null=True,
-        choices=[('active', 'Active'), ('failed', 'Failed'), ('pending', 'Pending')]
-    )
-    squad_account_created_at = models.DateTimeField(blank=True, null=True)
-
-    # ------------------------------------------------------------------ #
     #  Timestamps
     # ------------------------------------------------------------------ #
     last_login = models.DateTimeField(blank=True, null=True)
@@ -130,7 +118,7 @@ class User(AbstractBaseUser):
     # ------------------------------------------------------------------ #
     #  Auth config
     # ------------------------------------------------------------------ #
-    USERNAME_FIELD = 'phone'
+    USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = []
 
     objects = UserManager()
@@ -142,7 +130,7 @@ class User(AbstractBaseUser):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"{self.full_name or self.phone} ({self.role})"
+        return f"{self.full_name or self.email} ({self.role})"
 
     # ------------------------------------------------------------------ #
     #  PIN helpers  (NOT Django's password field)
@@ -164,14 +152,15 @@ class User(AbstractBaseUser):
     def has_module_perms(self, app_label):
         return self.is_superuser
 
+
 class PinResetOTP(models.Model):
     """
     Stores a short-lived OTP for the PIN reset flow.
- 
+
     Flow:
-        POST /api/auth/reset-pin/request/  → generates & sends OTP
+        POST /api/auth/reset-pin/request/  → generates & emails OTP
         POST /api/auth/reset-pin/confirm/  → verifies OTP, sets new PIN
- 
+
     One active OTP per user at a time — requesting a new OTP invalidates
     any previous ones (is_used=True on the old ones).
     """
@@ -184,39 +173,38 @@ class PinResetOTP(models.Model):
     is_used = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
- 
+
     class Meta:
         ordering = ['-created_at']
         verbose_name = 'PIN Reset OTP'
         verbose_name_plural = 'PIN Reset OTPs'
- 
+
     def __str__(self):
         return f"OTP for {self.user} — {'used' if self.is_used else 'active'}"
- 
+
     @staticmethod
     def generate_otp(length: int = 6) -> str:
         return ''.join(random.choices(string.digits, k=length))
- 
+
     @property
     def is_expired(self) -> bool:
         return timezone.now() > self.expires_at
- 
+
     @property
     def is_valid(self) -> bool:
         return not self.is_used and not self.is_expired
- 
+
     @classmethod
     def create_for_user(cls, user, expiry_minutes: int = 10) -> 'PinResetOTP':
         """
         Invalidates all previous OTPs for this user and creates a fresh one.
         expiry_minutes defaults to 10 — adjust in settings if needed.
         """
-        # Invalidate any existing unused OTPs for this user
         cls.objects.filter(user=user, is_used=False).update(is_used=True)
- 
+
         otp_value = cls.generate_otp()
         expires_at = timezone.now() + timezone.timedelta(minutes=expiry_minutes)
- 
+
         return cls.objects.create(
             user=user,
             otp=otp_value,

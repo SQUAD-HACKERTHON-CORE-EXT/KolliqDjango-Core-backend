@@ -218,7 +218,7 @@ class ListingPurchaseView(APIView):
             'Buy a listing using Kolliq wallet balance. '
             'Pure internal ledger transfer — no external payment call. '
             'Platform takes a 2% fee; seller receives the remainder. '
-            'Seller is notified via SMS on purchase.'
+            'Seller is notified via email on purchase.'
         ),
         request=None,
         responses={
@@ -286,15 +286,23 @@ class ListingPurchaseView(APIView):
 
         reference = f"MKT-{listing.id}-{buyer.id}"[:40]
 
+       
         with db_transaction.atomic():
-            buyer_wallet = type(buyer_wallet).objects.select_for_update().get(user=buyer)
-            seller_wallet = type(seller_wallet).objects.select_for_update().get(user=seller)
+            from apps.wallets.models import Wallet
+
+            buyer_wallet  = Wallet.objects.select_for_update().get(user=buyer)
+            seller_wallet = Wallet.objects.select_for_update().get(user=seller)
+            # ← No platform wallet lock needed anymore
 
             if buyer_wallet.balance < total:
                 return error_response(f'Insufficient balance: ₦{buyer_wallet.balance}.')
 
             buyer_wallet.debit(total)
             seller_wallet.credit(seller_receives)
+            # ← FIX: PLATFORM_CUT is no longer credited to any wallet.
+            # It simply stays inside the gap between what buyer paid and what
+            # seller received — recorded below as a PLATFORM_FEE transaction
+            # so services.platform_revenue can account for it.
 
             listing.quantity_available -= quantity
             if listing.quantity_available == 0:
@@ -319,13 +327,33 @@ class ListingPurchaseView(APIView):
                 description=f'Sale: {listing.title} x{quantity}',
                 metadata={'type': 'marketplace_sale', 'listing_id': str(listing.id), 'platform_fee': str(PLATFORM_CUT), 'reference': reference},
             )
+            Transaction.objects.create(
+                user=seller,
+                transaction_type=Transaction.Type.PLATFORM_FEE,
+                amount=PLATFORM_CUT,
+                status=Transaction.Status.SUCCESS,
+                related_user=buyer,
+                description=f'Marketplace fee (2%): {listing.title}',
+                metadata={'type': 'marketplace_platform_fee', 'fee_type': 'marketplace', 'listing_id': str(listing.id), 'reference': reference},
+            )
 
-        from services.africas_talking import ATService
-        at = ATService()
-        at.send_sms(
-            seller.phone,
-            f"Kolliq: {buyer.display_name} bought {quantity}x '{listing.title}' for ₦{seller_receives}. Balance: ₦{seller_wallet.balance}."
-        )
+        # FIX: services/africas_talking.py was removed when Kolliq migrated
+        # from SMS to email notifications — this used to import ATService,
+        # which no longer exists and would raise ModuleNotFoundError the
+        # first time anyone completed a purchase (after the wallet debit/
+        # credit had already committed). Now uses EmailService instead,
+        # matching every other notification path in the codebase.
+        if seller.email:
+            from services.email_service import EmailService
+            email_service = EmailService()
+            email_service.send_email(
+                seller.email,
+                'Kolliq: Item Sold',
+                f"{buyer.display_name} bought {quantity}x '{listing.title}' for ₦{seller_receives}. "
+                f"Balance: ₦{seller_wallet.balance}."
+            )
+        else:
+            logger.warning(f'Seller {seller.id} has no email — sale notification skipped for {reference}')
 
         from apps.scoring.tasks import recalculate_score
         recalculate_score.delay(str(seller.id))
@@ -461,7 +489,13 @@ class EnquiryCreateView(APIView):
     @extend_schema(
         operation_id='marketplace_enquiries_create',
         summary='Create enquiry',
-        description='Send an enquiry to a listing seller. Seller is notified via SMS.',
+        description=(
+            'Send an enquiry to a listing seller. Seller is notified via email. '
+            'Response includes both `seller_phone` and `seller_email` as contact fallbacks — '
+            'phone is optional on Kolliq accounts, so a seller who registered without one would '
+            'otherwise leave the buyer with no way to reach them. Both fields collapse to '
+            '"Contact via platform" if the seller has `show_phone` disabled.'
+        ),
         request=EnquiryCreateSerializer,
         responses={
             201: OpenApiResponse(description='Enquiry sent.'),
@@ -484,11 +518,22 @@ class EnquiryCreateView(APIView):
         from apps.marketplace.tasks import notify_seller_new_enquiry
         notify_seller_new_enquiry.delay(str(enquiry.id))
 
+        # phone is optional post phone->email migration — a phone-less
+        # seller previously left the buyer with seller_phone: null and no
+        # other way to reach them. email is now always included as a
+        # fallback when show_phone is true; when show_phone is false the
+        # buyer is still directed to the platform, unchanged.
+        seller = enquiry.listing.seller
         return success_response({
             'enquiry_id': str(enquiry.id),
             'listing_title': enquiry.listing.title,
             'seller_phone': (
-                enquiry.listing.seller.phone
+                seller.phone
+                if enquiry.listing.show_phone
+                else 'Contact via platform'
+            ),
+            'seller_email': (
+                seller.email
                 if enquiry.listing.show_phone
                 else 'Contact via platform'
             ),

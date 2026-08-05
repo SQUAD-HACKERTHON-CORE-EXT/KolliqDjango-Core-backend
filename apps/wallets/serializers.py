@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from decimal import Decimal
 from .models import Wallet, WithdrawalRequest
-from services.squad import NIGERIAN_BANKS, get_bank_name
+from services.paystack import NIGERIAN_BANKS, get_bank_name
 
 
 def get_bank_by_code(code):
@@ -13,13 +13,13 @@ class WalletSerializer(serializers.ModelSerializer):
         model = Wallet
         fields = [
             'id',
-            'squad_account_number',
-            'squad_account_name',
-            'squad_bank_name',
+            'paystack_account_number',
+            'paystack_account_name',
+            'paystack_bank_name',
             'balance',
             'escrow_balance',
             'savings_balance',
-            'squad_creation_status',
+            'paystack_creation_status',
             'created_at',
         ]
         read_only_fields = fields
@@ -29,10 +29,10 @@ class WalletPublicSerializer(serializers.ModelSerializer):
     class Meta:
         model = Wallet
         fields = [
-            'squad_account_number',
-            'squad_account_name',
-            'squad_bank_name',
-            'squad_creation_status',
+            'paystack_account_number',
+            'paystack_account_name',
+            'paystack_bank_name',
+            'paystack_creation_status',
         ]
         read_only_fields = fields
 
